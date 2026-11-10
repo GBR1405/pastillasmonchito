@@ -2,7 +2,7 @@
 
 // Service worker mínimo: permite instalar la app y abrirla aunque no haya internet.
 // Los datos (/api) nunca se guardan en caché: siempre se piden al servidor.
-const CACHE = 'pastillero-v2';
+const CACHE = 'pastillero-v3';
 const ASSETS = ['/', '/styles.css', '/app.js', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png'];
 
 self.addEventListener('install', (event) => {

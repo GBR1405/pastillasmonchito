@@ -70,8 +70,10 @@ async function loadSchedule() {
 async function loadMedicines() {
   const [meds, daily] = await Promise.all([
     db.all(
-      `SELECT id, name, unit, code, expires_on, stock, color, notes
-         FROM medicines WHERE active = 1 ORDER BY name COLLATE NOCASE`
+      `SELECT m.id, m.name, m.unit, m.code, m.expires_on, m.stock, m.color, m.notes, p.updated_at AS photo_at
+         FROM medicines m
+         LEFT JOIN medicine_photos p ON p.medicine_id = m.id
+        WHERE m.active = 1 ORDER BY m.name COLLATE NOCASE`
     ),
     db.all(
       `SELECT si.medicine_id, SUM(si.quantity) AS q
@@ -142,11 +144,47 @@ function stockStatements(snapshot, sign) {
     );
 }
 
+const markInventoryChecked = () =>
+  db.run(
+    "INSERT INTO meta (key, value) VALUES ('inventory_checked_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    [nowIso()]
+  );
+
+// Medicinas que según el inventario no alcanzan para esta toma (la toma se registra igual)
+async function shortItems(snapshot) {
+  const ids = snapshot.filter((i) => i.medicine_id).map((i) => i.medicine_id);
+  if (!ids.length) return [];
+  const rows = await db.all(
+    `SELECT id, name, stock FROM medicines WHERE id IN (${ids.map(() => '?').join(',')})`,
+    ids
+  );
+  return snapshot
+    .filter((i) => {
+      const m = rows.find((r) => r.id === i.medicine_id);
+      return m && m.stock != null && m.stock < i.quantity;
+    })
+    .map((i) => i.name);
+}
+
 async function memberById(id) {
   const m = await db.get('SELECT id, name FROM members WHERE id = ?', [Number(id)]);
   if (!m) throw bad('Elige quién eres');
   return m;
 }
+
+// Solo Gabriel, Bosco y Marianne (o quienes diga ADMIN_MEMBERS) pueden cambiar horarios y familia.
+// La persona se identifica con el nombre que eligió en "¿Quién eres?" (cabecera x-member-id).
+const requireAdmin = wrap(async (req, res, next) => {
+  const id = Number(req.get('x-member-id'));
+  const m = id ? await db.get('SELECT name FROM members WHERE id = ? AND active = 1', [id]) : null;
+  if (!m || !db.isAdminName(m.name)) {
+    throw new HttpError(403, 'Solo Gabriel, Bosco o Marianne pueden cambiar esta parte.');
+  }
+  next();
+});
+
+const PHOTO_RE = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
+const PHOTO_MAX = 1_500_000; // caracteres (~1.1 MB de imagen)
 
 /* ------------------------------------------------------------------ */
 /* Rutas                                                               */
@@ -191,18 +229,22 @@ function buildRouter() {
     wrap(async (req, res) => {
       const date = req.query.date;
       if (!isDate(date)) throw bad('Fecha inválida');
-      const [members, slots, medicines, doses, symptoms, observations, patientName] = await Promise.all([
-        db.all('SELECT id, name FROM members WHERE active = 1 ORDER BY name COLLATE NOCASE'),
+      const [members, slots, medicines, doses, symptoms, observations, patientName, invChecked] = await Promise.all([
+        db
+          .all('SELECT id, name FROM members WHERE active = 1 ORDER BY name COLLATE NOCASE')
+          .then((rows) => rows.map((m) => ({ ...m, admin: db.isAdminName(m.name) }))),
         loadSchedule(),
         loadMedicines(),
         db.all('SELECT * FROM doses WHERE date = ?', [date]),
         db.all('SELECT * FROM symptoms WHERE date = ? ORDER BY time, id', [date]),
         db.all('SELECT * FROM observations WHERE date = ? ORDER BY time, id', [date]),
         getSetting('patient_name', 'Abuelo'),
+        getSetting('inventory_checked_at', null),
       ]);
       res.json({
         date,
         patient_name: patientName,
+        inventory_checked_at: invChecked,
         members,
         members_locked: !!db.familyFromEnv(),
         push_key: push.publicKey(),
@@ -248,6 +290,7 @@ function buildRouter() {
   /* ---------- Ajustes ---------- */
   r.put(
     '/settings',
+    requireAdmin,
     wrap(async (req, res) => {
       const name = text(req.body?.patient_name, 40);
       if (!name) throw bad('Escribe un nombre');
@@ -282,6 +325,7 @@ function buildRouter() {
   r.delete(
     '/members/:id',
     lockedFamily,
+    requireAdmin,
     wrap(async (req, res) => {
       await db.run('UPDATE members SET active = 0 WHERE id = ?', [Number(req.params.id)]);
       res.json({ ok: true });
@@ -337,6 +381,7 @@ function buildRouter() {
         [m.name, m.unit, m.code, m.expires, m.stock, m.color, m.notes, Number(req.params.id)]
       );
       if (!rs.rowsAffected) throw notFound('Medicina no encontrada');
+      await markInventoryChecked();
       res.json({ ok: true });
     })
   );
@@ -350,6 +395,7 @@ function buildRouter() {
         [amount, Number(req.params.id)]
       );
       if (!rs.rowsAffected) throw notFound('Medicina no encontrada');
+      await markInventoryChecked();
       res.json({ ok: true });
     })
   );
@@ -361,12 +407,61 @@ function buildRouter() {
       await db.batch([
         { sql: 'UPDATE medicines SET active = 0 WHERE id = ?', args: [id] },
         { sql: 'DELETE FROM slot_items WHERE medicine_id = ?', args: [id] },
+        { sql: 'DELETE FROM medicine_photos WHERE medicine_id = ?', args: [id] },
       ]);
       res.json({ ok: true });
     })
   );
 
+  // Revisión semanal del inventario: cualquiera de la familia la marca y el aviso se quita para todos
+  r.post(
+    '/inventory/checked',
+    wrap(async (req, res) => {
+      await markInventoryChecked();
+      res.json({ ok: true });
+    })
+  );
+
+  /* ---------- Foto de la caja ---------- */
+  r.get(
+    '/medicines/:id/photo',
+    wrap(async (req, res) => {
+      const p = await db.get('SELECT data, updated_at FROM medicine_photos WHERE medicine_id = ?', [
+        Number(req.params.id),
+      ]);
+      if (!p) throw notFound('Esta medicina no tiene foto');
+      res.json(p);
+    })
+  );
+
+  r.put(
+    '/medicines/:id/photo',
+    wrap(async (req, res) => {
+      const id = Number(req.params.id);
+      const data = String(req.body?.data || '');
+      if (!PHOTO_RE.test(data)) throw bad('La foto no es válida');
+      if (data.length > PHOTO_MAX) throw bad('La foto es demasiado grande');
+      const med = await db.get('SELECT id FROM medicines WHERE id = ? AND active = 1', [id]);
+      if (!med) throw notFound('Medicina no encontrada');
+      await db.run(
+        `INSERT INTO medicine_photos (medicine_id, data, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(medicine_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`,
+        [id, data, nowIso()]
+      );
+      res.json({ ok: true });
+    })
+  );
+
+  r.delete(
+    '/medicines/:id/photo',
+    wrap(async (req, res) => {
+      await db.run('DELETE FROM medicine_photos WHERE medicine_id = ?', [Number(req.params.id)]);
+      res.json({ ok: true });
+    })
+  );
+
   /* ---------- Horarios ---------- */
+  r.use(['/slots', '/items'], requireAdmin);
   function readSlot(body) {
     const b = body || {};
     if (!isTime(b.time)) throw bad('Hora inválida');
@@ -474,9 +569,10 @@ function buildRouter() {
             args: [member.id, member.name, b.result, note, consumed, givenAt.toISOString(), existing.id],
           },
         ];
+        const short = existing.consumed === 0 && consumed ? await shortItems(snapshot) : [];
         if (existing.consumed !== consumed) stmts.push(...stockStatements(snapshot, consumed ? -1 : 1));
         await db.batch(stmts);
-        return res.json({ id: existing.id, updated: true });
+        return res.json({ id: existing.id, updated: true, short });
       }
 
       const slot = await db.get('SELECT id, time, end_time FROM slots WHERE id = ? AND active = 1', [slotId]);
@@ -510,8 +606,9 @@ function buildRouter() {
         },
         ...(consumed ? stockStatements(items, -1) : []),
       ];
+      const short = consumed ? await shortItems(items) : [];
       await db.batch(stmts);
-      res.status(201).json({ ok: true });
+      res.status(201).json({ ok: true, short });
     })
   );
 
@@ -638,6 +735,7 @@ const cronHandler = wrap(async (req, res) => {
 function errorHandler(err, req, res, next) { // eslint-disable-line no-unused-vars
   if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
   if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Datos inválidos' });
+  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'Lo que se envió es demasiado grande' });
   if (err && /UNIQUE constraint/i.test(String(err.message))) {
     return res.status(409).json({ error: 'Ese horario ya estaba registrado. Actualiza la pantalla.' });
   }
@@ -656,7 +754,12 @@ function createApp({ serveStatic = false } = {}) {
     });
     next();
   });
-  app.use(express.json({ limit: '100kb' }));
+  // Las fotos de las cajas necesitan un límite mayor; todo lo demás sigue en 100 kb
+  const bigJson = express.json({ limit: '2mb' });
+  const smallJson = express.json({ limit: '100kb' });
+  app.use((req, res, next) =>
+    (req.method === 'PUT' && /^\/api\/medicines\/\d+\/photo$/.test(req.path) ? bigJson : smallJson)(req, res, next)
+  );
   app.use('/api', (req, res, next) => {
     res.set('Cache-Control', 'no-store');
     next();

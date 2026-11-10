@@ -105,7 +105,7 @@
     try {
       res = await fetch('/api' + path, {
         method,
-        headers: { 'Content-Type': 'application/json', 'x-family-code': S.code },
+        headers: { 'Content-Type': 'application/json', 'x-family-code': S.code, 'x-member-id': S.me ? String(S.me) : '' },
         body: body ? JSON.stringify(body) : undefined,
         cache: 'no-store',
       });
@@ -123,6 +123,9 @@
     if (!res.ok) throw new Error((data && data.error) || 'Algo salió mal. Intenta de nuevo.');
     return data;
   }
+
+  // Gabriel, Bosco y Marianne pueden entrar a Horario y Familia (lo decide el servidor)
+  const isAdmin = () => !!(S.data && S.me && S.data.members.some((m) => m.id === S.me && m.admin));
 
   async function loadDay() {
     S.data = await api('/state?date=' + S.date);
@@ -266,6 +269,43 @@
     </div>`;
   }
 
+  // Recordatorio semanal para revisar el inventario (se quita para todos cuando alguien lo revisa)
+  const INV_DAYS = 7;
+  function invDaysSince() {
+    const at = S.data && S.data.inventory_checked_at;
+    return at ? Math.floor((Date.now() - Date.parse(at)) / 86400000) : null;
+  }
+  const inventoryDue = () => {
+    if (!S.data || !S.data.medicines.length) return false;
+    const d = invDaysSince();
+    return d === null || d >= INV_DAYS;
+  };
+
+  function inventoryBanner() {
+    if (S.date !== todayStr() || !inventoryDue()) return '';
+    const d = invDaysSince();
+    return `<div class="push-banner inv-banner">
+      <span class="push-banner-ico" aria-hidden="true">📦</span>
+      <div class="push-banner-text"><b>Toca revisar el inventario</b><span>${
+        d === null ? 'Todavía nadie lo ha revisado.' : `La última revisión fue hace ${plural(d, 'día', 'días')}.`
+      } Cuenta las pastillas y corrige lo que no cuadre.</span></div>
+      <div class="push-banner-actions">
+        <button class="btn btn-small btn-primary" data-action="go-inventory">Revisar inventario</button>
+        <button class="btn btn-small btn-ghost" data-action="inv-checked">Ya está al día</button>
+      </div>
+    </div>`;
+  }
+
+  // Medicinas de la lista que según el inventario no alcanzan
+  function shortNames(items) {
+    return items
+      .filter((i) => {
+        const m = S.data.medicines.find((x) => x.id === i.medicine_id);
+        return m && m.stock != null && m.stock < i.quantity;
+      })
+      .map((i) => i.name);
+  }
+
   /* ================================================================== */
   /* Vistas                                                              */
   /* ================================================================== */
@@ -277,6 +317,7 @@
       app.innerHTML = loginView();
     } else {
       app.innerHTML = headerView() + `<main class="main">${bodyView()}</main>` + tabbarView();
+      fillPhotos();
     }
     window.scrollTo(0, y);
   }
@@ -482,7 +523,9 @@
   function pillsSection(nDone) {
     const d = S.data;
     if (!d.slots.length) {
-      return `<div class="card empty">Todavía no hay horarios. Créalos en <b>Medicinas → Horario</b>.</div>`;
+      return `<div class="card empty">Todavía no hay horarios. ${
+        isAdmin() ? 'Créalos en <b>Medicinas → Horario</b>.' : 'Pídele a Gabriel, Bosco o Marianne que los creen.'
+      }</div>`;
     }
     const pct = Math.round((nDone / d.slots.length) * 100);
     const isToday = S.date === todayStr();
@@ -545,6 +588,7 @@
 
     return `<div class="stack">
       ${dayStatus(states, nDone, pct, isToday, nowM)}
+      ${inventoryBanner()}
       ${pushBanner()}
       ${alertsView()}
       <ol class="timeline" aria-label="Horarios del día">${timeline}</ol>
@@ -788,15 +832,102 @@
   function medicinesView() {
     const d = S.data;
     if (!d) return loadingView();
-    const sub = [
-      ['inventario', 'Inventario'],
-      ['horario', 'Horario'],
-      ['familia', 'Familia'],
-    ]
+    const admin = isAdmin();
+    const secs = admin
+      ? [['inventario', 'Inventario'], ['horario', 'Horario'], ['familia', 'Familia']]
+      : [['inventario', 'Inventario'], ['telefono', 'Este teléfono']];
+    // Si alguien sin permiso quedó en Horario o Familia, vuelve a Inventario
+    if (!secs.some(([id]) => id === S.medSection)) S.medSection = admin && S.medSection === 'telefono' ? 'familia' : 'inventario';
+    const sub = secs
       .map(([id, label]) => `<button data-action="medsec" data-sec="${id}" aria-pressed="${S.medSection === id}">${label}</button>`)
       .join('');
-    const body = S.medSection === 'horario' ? scheduleAdmin() : S.medSection === 'familia' ? familyAdmin() : inventoryAdmin();
-    return `<div class="subtabs" role="group" aria-label="Secciones de medicinas">${sub}</div>${body}`;
+    const body =
+      S.medSection === 'horario' ? scheduleAdmin()
+        : S.medSection === 'familia' ? familyAdmin()
+          : S.medSection === 'telefono' ? phoneView()
+            : inventoryAdmin();
+    return `<div class="subtabs" role="group" aria-label="Secciones de medicinas" style="grid-template-columns:repeat(${secs.length},1fr)">${sub}</div>${body}`;
+  }
+
+  // Lo que cualquiera de la familia puede ver aunque no tenga acceso a Familia
+  function phoneView() {
+    const me = S.data.members.find((m) => m.id === S.me);
+    return `<div class="stack">
+      <section class="card stack">
+        <p>Estás usando la app como <b>${me ? esc(me.name) : 'nadie todavía'}</b>.</p>
+        <p class="small muted">Horario y Familia solo los pueden cambiar Gabriel, Bosco o Marianne.</p>
+        <button class="btn btn-soft" data-action="who">Cambiar quién soy</button>
+      </section>
+      ${pushCard()}
+      ${installCard()}
+      <button class="btn btn-ghost btn-xl" data-action="logout">Salir / cambiar código</button>
+    </div>`;
+  }
+
+  function installCard() {
+    return `<section class="card stack">
+        <h2 class="section-title" style="margin:0">Usar como app</h2>
+        ${S.installEvt ? `<button class="btn btn-primary btn-xl" data-action="install">📲 Instalar en este teléfono</button>` : ''}
+        <p class="small muted"><b>Android (Chrome):</b> menú ⋮ → “Instalar aplicación” o “Agregar a la pantalla principal”.<br>
+        <b>iPhone (Safari):</b> botón Compartir → “Agregar a inicio”.</p>
+      </section>`;
+  }
+
+  /* ---- Fotos de las cajas (se guardan en memoria para no pedirlas cada vez) ---- */
+  const photoCache = new Map(); // `${id}:${photo_at}` -> data URL
+  const photoKey = (m) => `${m.id}:${m.photo_at}`;
+
+  async function getPhoto(m) {
+    const k = photoKey(m);
+    if (!photoCache.has(k)) {
+      const p = await api(`/medicines/${m.id}/photo`);
+      photoCache.set(k, p.data);
+    }
+    return photoCache.get(k);
+  }
+
+  // Después de pintar, llena las miniaturas que todavía no estaban cargadas
+  function fillPhotos() {
+    if (!S.data) return;
+    document.querySelectorAll('img[data-photo]:not([src])').forEach((img) => {
+      const m = S.data.medicines.find((x) => x.id === Number(img.dataset.photo));
+      if (!m || !m.photo_at) return;
+      getPhoto(m).then((src) => { img.src = src; }).catch(() => {});
+    });
+  }
+
+  // Achica la foto del teléfono (que suele pesar varios MB) antes de subirla
+  function shrinkImage(file, max = 1280, quality = 0.75) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, max / Math.max(img.width, img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.round(img.width * scale);
+        c.height = Math.round(img.height * scale);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        URL.revokeObjectURL(url);
+        resolve(c.toDataURL('image/jpeg', quality));
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('No se pudo leer la foto. Prueba con otra.'));
+      };
+      img.src = url;
+    });
+  }
+
+  async function openPhoto(m) {
+    openSheet(m.name, `<div class="photo-full">${loadingView()}</div>`, { plain: true });
+    try {
+      const src = await getPhoto(m);
+      const box = $('.photo-full');
+      if (box) box.innerHTML = `<img src="${esc(src)}" alt="Foto de la caja de ${esc(m.name)}">`;
+    } catch (err) {
+      const box = $('.photo-full');
+      if (box) box.innerHTML = `<p class="form-error">${esc(err.message)}</p>`;
+    }
   }
 
   function inventoryAdmin() {
@@ -820,7 +951,12 @@
           stock = `<p>Quedan <b>${fmtQty(m.stock)}</b>${m.daily > 0 ? ` · alcanzan para <span class="badge badge-${cls}">${m.days_left < 1 ? 'menos de 1 día' : plural(m.days_left, 'día', 'días')}</span>` : ''}</p>`;
         }
         return `<article class="card med">
-          <span class="dot dot-big" style="background:${esc(m.color)}"></span>
+          ${
+            m.photo_at
+              ? `<button type="button" class="med-photo" data-action="view-photo" data-id="${m.id}" aria-label="Ver la foto de la caja de ${esc(m.name)}" style="border-color:${esc(m.color)}">
+                  <img data-photo="${m.id}" alt="" ${photoCache.has(photoKey(m)) ? `src="${esc(photoCache.get(photoKey(m)))}"` : ''}></button>`
+              : `<span class="dot dot-big" style="background:${esc(m.color)}"></span>`
+          }
           <div class="med-main">
             <h3>${esc(m.name)}</h3>
             <p class="muted">${m.unit ? esc(m.unit) : 'sin presentación'}${m.daily > 0 ? ` · ${fmtQty(m.daily)} al día` : ' · sin horario'}</p>
@@ -836,7 +972,16 @@
         </article>`;
       })
       .join('');
+    const since = invDaysSince();
+    const due = inventoryDue();
     return `<div class="stack">
+      <section class="card stack inv-check ${due ? 'inv-check-due' : ''}">
+        <p><b>Revisión del inventario:</b> ${
+          since === null ? 'nunca se ha hecho.' : since === 0 ? 'se hizo hoy ✓' : `hace ${plural(since, 'día', 'días')}.`
+        }</p>
+        <p class="small muted">Cada semana cuenten lo que queda y corrijan con “Editar”. Las tomas lo van restando solas.</p>
+        <button class="btn ${due ? 'btn-primary' : 'btn-soft'}" data-action="inv-checked">✓ Ya revisé el inventario</button>
+      </section>
       <button class="btn btn-primary btn-xl" data-action="add-med">+ Nueva medicina</button>
       ${alertsView()}
       ${cards || `<div class="card empty">No hay medicinas todavía.</div>`}
@@ -911,12 +1056,7 @@
           <button class="btn btn-soft" type="submit">Guardar</button>
         </form>
       </section>
-      <section class="card stack">
-        <h2 class="section-title" style="margin:0">Usar como app</h2>
-        ${S.installEvt ? `<button class="btn btn-primary btn-xl" data-action="install">📲 Instalar en este teléfono</button>` : ''}
-        <p class="small muted"><b>Android (Chrome):</b> menú ⋮ → “Instalar aplicación” o “Agregar a la pantalla principal”.<br>
-        <b>iPhone (Safari):</b> botón Compartir → “Agregar a inicio”.</p>
-      </section>
+      ${installCard()}
       <button class="btn btn-ghost btn-xl" data-action="logout">Salir / cambiar código</button>
     </div>`;
   }
@@ -1015,10 +1155,8 @@
   function needMe() {
     if (S.me) return true;
     if (!S.data.members.length) {
-      toast('Primero agrega los nombres de la familia');
-      S.tab = 'medicinas';
-      S.medSection = 'familia';
-      render();
+      toast('Primero agrega tu nombre');
+      openPickMe();
       return false;
     }
     toast('Elige quién eres y vuelve a intentarlo');
@@ -1036,9 +1174,11 @@
     const isToday = S.date === todayStr();
     const defTime = dose ? hhmm(new Date(dose.given_at)) : isToday ? hhmm(new Date()) : slot.time;
     const selectedResult = dose ? dose.result : 'bien';
+    const short = dose ? [] : shortNames(items);
     openSheet(
       `${fmt12(slot.time)} · ${dose ? 'Editar registro' : '¿Se las diste?'}`,
       `<p class="sheet-lead">${items.map((i) => `${fmtQty(i.quantity)} ${esc(i.name)}`).join(' · ')}</p>
+       ${short.length ? `<div class="alert alert-warn"><span aria-hidden="true">⚠️</span><span>Según el inventario no hay suficiente <b>${esc(short.join(', '))}</b>. Igual puedes registrar la toma; después actualiza el inventario.</span></div>` : ''}
        <label class="field"><span>¿Quién se las dio?</span>
          <select name="by" required>${memberOptions(dose ? dose.given_by_id : S.me)}</select></label>
        <fieldset class="field"><legend>¿Cómo le fue?</legend>
@@ -1055,7 +1195,7 @@
         submitLabel: 'Guardar',
         onSubmit: async (f) => {
           const time = f.elements.time.value;
-          await api('/doses', {
+          const r = await api('/doses', {
             method: 'POST',
             body: {
               date: S.date,
@@ -1071,7 +1211,10 @@
             store.set('pf_me', String(S.me));
           }
           await loadDay();
-          toast('Guardado ✓');
+          const missing = (r && r.short) || [];
+          if (missing.length) {
+            toast(`Guardado ✓ Pero en el inventario no había ${missing.join(', ')}. Actualiza el inventario.`, 6000);
+          } else toast('Guardado ✓');
         },
       }
     );
@@ -1126,6 +1269,16 @@
          <div class="swatches">${COLORS.map((c) => `<label class="swatch"><input type="radio" name="color" value="${c}" ${c.toLowerCase() === String(m.color).toLowerCase() ? 'checked' : ''} aria-label="Color ${c}"><span style="background:${c}"></span></label>`).join('')}</div></fieldset>
        <label class="field"><span>Notas (opcional)</span>
          <textarea name="notes" rows="2" maxlength="300" placeholder="Ej: tomar con comida.">${esc(m.notes)}</textarea></label>
+       <div class="field"><span>Foto de la caja (opcional)</span>
+         <div class="photo-pick">
+           <div class="photo-preview" id="photo-preview"></div>
+           <div class="photo-btns">
+             <label class="btn btn-soft btn-small photo-file">📷 <span id="photo-btn-label">Tomar o elegir foto</span>
+               <input type="file" id="photo-input" accept="image/*"></label>
+             <button type="button" class="btn btn-ghost btn-small" id="photo-remove" hidden>Quitar foto</button>
+           </div>
+         </div>
+         <span class="field-hint">Sirve para reconocer la caja o enseñársela al doctor o en la farmacia.</span></div>
        ${med ? `<button type="button" class="btn btn-danger btn-xl" data-action="del-med" data-id="${med.id}" style="margin-bottom:14px">Quitar esta medicina</button>` : ''}`,
       {
         onSubmit: async (f) => {
@@ -1138,12 +1291,55 @@
             color: (f.querySelector('input[name=color]:checked') || {}).value || COLORS[4],
             notes: f.elements.notes.value,
           };
-          await api(med ? `/medicines/${med.id}` : '/medicines', { method: med ? 'PUT' : 'POST', body });
+          const r = await api(med ? `/medicines/${med.id}` : '/medicines', { method: med ? 'PUT' : 'POST', body });
+          const id = med ? med.id : r.id;
+          let photoErr = '';
+          try {
+            if (photo.data) await api(`/medicines/${id}/photo`, { method: 'PUT', body: { data: photo.data } });
+            else if (photo.removed) await api(`/medicines/${id}/photo`, { method: 'DELETE' });
+          } catch (err) {
+            photoErr = err.message;
+          }
           await loadDay();
-          toast('Guardado ✓');
+          toast(photoErr ? `Guardado, pero la foto no se subió: ${photoErr}` : 'Guardado ✓');
         },
       }
     );
+
+    // Foto: se elige aquí y se sube al guardar
+    const photo = { data: null, removed: false };
+    const preview = $('#photo-preview');
+    const removeBtn = $('#photo-remove');
+    const label = $('#photo-btn-label');
+    const show = (src) => {
+      preview.innerHTML = src ? `<img src="${esc(src)}" alt="Foto de la caja">` : '<span aria-hidden="true">📦</span>';
+      removeBtn.hidden = !src;
+      label.textContent = src ? 'Cambiar foto' : 'Tomar o elegir foto';
+    };
+    show(null);
+    if (med && med.photo_at) {
+      preview.innerHTML = '<span class="small muted">Cargando…</span>';
+      getPhoto(med).then((src) => { if (!photo.data && !photo.removed) show(src); }).catch(() => show(null));
+    }
+    $('#photo-input').addEventListener('change', async (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      preview.innerHTML = '<span class="small muted">Preparando…</span>';
+      try {
+        photo.data = await shrinkImage(file);
+        photo.removed = false;
+        show(photo.data);
+      } catch (err) {
+        show(null);
+        $('#sheet-error').textContent = err.message;
+      }
+    });
+    removeBtn.addEventListener('click', () => {
+      photo.data = null;
+      photo.removed = !!(med && med.photo_at);
+      show(null);
+    });
   }
 
   function restockSheet(med) {
@@ -1220,12 +1416,12 @@
   /* ================================================================== */
 
   let toastTimer = null;
-  function toast(msg) {
+  function toast(msg, ms = 2600) {
     const el = $('#toast');
     el.textContent = msg;
     el.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+    toastTimer = setTimeout(() => el.classList.remove('show'), ms);
   }
 
   /* ================================================================== */
@@ -1253,7 +1449,17 @@
         break;
       case 'section': S.section = el.dataset.section; render(); break;
       case 'medsec': S.medSection = el.dataset.sec; render(); break;
-      case 'go-family': S.tab = 'medicinas'; S.medSection = 'familia'; render(); window.scrollTo(0, 0); break;
+      case 'go-family':
+        if (isAdmin()) { S.tab = 'medicinas'; S.medSection = 'familia'; render(); window.scrollTo(0, 0); }
+        else openPickMe();
+        break;
+      case 'go-inventory': S.tab = 'medicinas'; S.medSection = 'inventario'; render(); window.scrollTo(0, 0); break;
+      case 'inv-checked':
+        await api('/inventory/checked', { method: 'POST' });
+        await loadDay();
+        toast('Inventario revisado ✓ Te avisamos de nuevo en una semana.');
+        break;
+      case 'view-photo': { const m = S.data.medicines.find((x) => x.id === id); if (m) await openPhoto(m); break; }
       case 'prev-day': S.date = addDays(S.date, -1); render(); await loadDay(); break;
       case 'next-day':
         if (S.date < todayStr()) { S.date = addDays(S.date, 1); render(); await loadDay(); }
@@ -1278,7 +1484,7 @@
       case 'push-later': store.set('pf_push_later', '1'); render(); break;
       case 'go-push': {
         S.tab = 'medicinas';
-        S.medSection = 'familia';
+        S.medSection = isAdmin() ? 'familia' : 'telefono';
         render();
         const c = $('#push-card');
         if (c) c.scrollIntoView({ block: 'center' });
@@ -1500,7 +1706,7 @@
   window.addEventListener('beforeinstallprompt', (e) => {
     e.preventDefault();
     S.installEvt = e;
-    if (S.code && S.tab === 'medicinas' && S.medSection === 'familia') render();
+    if (S.code && S.tab === 'medicinas' && (S.medSection === 'familia' || S.medSection === 'telefono')) render();
   });
 
   if ('serviceWorker' in navigator) {

@@ -47,6 +47,7 @@ Abre http://localhost:3000 y entra con el código `familia`. En local usa una ba
    | `TURSO_AUTH_TOKEN` | el token del paso 1 |
    | `FAMILY_CODE` | el código que toda la familia escribirá para entrar (difícil de adivinar) |
    | `FAMILY_MEMBERS` | los nombres separados por comas, por ejemplo `Gabriel, María José, Tía Ana, Luis` |
+   | `ADMIN_MEMBERS` | (opcional) quiénes pueden cambiar **Horario** y **Familia**. Si se deja vacío: `Gabriel, Bosco, Marianne` |
    | `VAPID_PUBLIC_KEY` | la "Public Key" del paso 3 |
    | `VAPID_PRIVATE_KEY` | la "Private Key" del paso 3 |
    | `VAPID_SUBJECT` | `mailto:` y un correo de contacto, por ejemplo `mailto:nombre@gmail.com` |

@@ -135,6 +135,12 @@ const SCHEMA = [
      sent_at TEXT NOT NULL,
      PRIMARY KEY (date, slot_id, kind)
    )`,
+  // Foto de la caja de cada medicina (opcional). Se guarda aparte para no cargarla en cada consulta.
+  `CREATE TABLE IF NOT EXISTS medicine_photos (
+     medicine_id INTEGER PRIMARY KEY,
+     data TEXT NOT NULL,
+     updated_at TEXT NOT NULL
+   )`,
   'CREATE INDEX IF NOT EXISTS idx_symptoms_date ON symptoms(date)',
   'CREATE INDEX IF NOT EXISTS idx_observations_date ON observations(date)',
 ];
@@ -144,8 +150,7 @@ const SCHEMA = [
 /* ------------------------------------------------------------------ */
 
 // "Gabriel, María José, Tía Ana" -> ['Gabriel', 'María José', 'Tía Ana']
-function familyFromEnv() {
-  const raw = process.env.FAMILY_MEMBERS;
+function parseNames(raw) {
   if (!raw || !raw.trim()) return null;
   const seen = new Set();
   const names = [];
@@ -159,6 +164,16 @@ function familyFromEnv() {
   }
   return names.length ? names : null;
 }
+
+const familyFromEnv = () => parseNames(process.env.FAMILY_MEMBERS);
+
+// Quienes pueden entrar a Medicinas → Horario y Familia
+const DEFAULT_ADMINS = 'Gabriel, Bosco, Marianne';
+function adminKeys() {
+  const names = parseNames(process.env.ADMIN_MEMBERS || DEFAULT_ADMINS) || [];
+  return new Set(names.map(nameKey));
+}
+const isAdminName = (name) => adminKeys().has(nameKey(String(name || '')));
 
 const nameKey = (s) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
 
@@ -276,4 +291,4 @@ function init() {
   return readyPromise;
 }
 
-module.exports = { init, all, get, run, batch, familyFromEnv };
+module.exports = { init, all, get, run, batch, familyFromEnv, isAdminName };
